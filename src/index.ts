@@ -7,6 +7,7 @@ import { healthRoutes } from "./api/health.js";
 import { adminRoutes } from "./api/admin.js";
 import { webhookRoutes } from "./api/webhooks.js";
 import { feedbackRoutes } from "./api/feedback.js";
+import { view360Routes } from "./api/view360.js";
 
 async function main() {
   const app = Fastify({
@@ -22,6 +23,7 @@ async function main() {
   await app.register(adminRoutes);
   await app.register(webhookRoutes);
   await app.register(feedbackRoutes);
+  await app.register(view360Routes);
 
   // Start
   try {

@@ -9,6 +9,7 @@ export interface WhatsAppDeliveryOptions {
   severity: string;
   customerName: string;
   waConfig: WhatsAppConfig;
+  view360Url?: string;
 }
 
 export interface WhatsAppDeliveryResult {
@@ -26,10 +27,9 @@ export interface WhatsAppDeliveryResult {
 export async function deliverViaWhatsApp(
   options: WhatsAppDeliveryOptions
 ): Promise<WhatsAppDeliveryResult> {
-  const { phone, title, body, severity, customerName, waConfig } = options;
+  const { phone, title, body, severity, customerName, waConfig, view360Url } = options;
 
-  // TODO: Format signal for WhatsApp (shorter than email, no HTML)
-  const formattedBody = formatWhatsAppMessage(title, body, severity, customerName);
+  const formattedBody = formatWhatsAppMessage(title, body, severity, customerName, view360Url);
 
   try {
     const result = await sendSignalNotification(phone, title, formattedBody, waConfig);
@@ -55,19 +55,24 @@ export function formatWhatsAppMessage(
   title: string,
   body: string,
   severity: string,
-  customerName: string
+  customerName: string,
+  view360Url?: string
 ): string {
-  // TODO: Add emoji indicators for severity
-  // TODO: Truncate body if exceeding WhatsApp limits
   const severityIcon =
-    severity === "critical" ? "[!!!]" :
-    severity === "high" ? "[!!]" :
-    severity === "medium" ? "[!]" : "";
+    severity === "critical" ? "\u{1F534}" :
+    severity === "high" ? "\u{1F7E0}" :
+    severity === "medium" ? "\u{1F535}" : "\u{26AA}";
 
-  return [
+  const parts = [
     `${severityIcon} *${title}*`,
     `_${customerName}_`,
     "",
     body,
-  ].join("\n").slice(0, 4096);
+  ];
+
+  if (view360Url) {
+    parts.push("", `\u{1F517} Full 360: ${view360Url}`);
+  }
+
+  return parts.join("\n").slice(0, 4096);
 }

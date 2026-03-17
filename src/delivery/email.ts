@@ -1,5 +1,6 @@
 import { graphPost, type MsGraphCredentials } from "../adapters/microsoft/client.js";
 import { logger } from "../lib/logger.js";
+import { generate360Url } from "../api/view360-token.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -74,7 +75,8 @@ export function formatSignalEmail(
   body: string,
   recommendation: string | null,
   severity: string,
-  customerName: string
+  customerName: string,
+  options?: { tenantId?: string; customerId?: string; signalId?: string }
 ): { subject: string; htmlBody: string; textBody: string } {
   const subject = `[Signal] ${title} — ${customerName}`;
   const color = SEVERITY_COLORS[severity] ?? SEVERITY_COLORS.low;
@@ -93,6 +95,10 @@ export function formatSignalEmail(
   <div style="margin: 16px; padding: 12px; background: #F3F4F6; border-radius: 6px;">
     <strong style="font-size: 13px;">Recommendation:</strong>
     <p style="margin: 4px 0 0 0;">${escapeHtml(recommendation)}</p>
+  </div>` : ""}
+  ${options?.tenantId && options?.customerId ? `
+  <div style="margin: 16px; text-align: center;">
+    <a href="${generate360Url(options.tenantId, options.customerId, options.signalId)}" style="display:inline-block;padding:10px 24px;background:#2563EB;color:#fff;text-decoration:none;border-radius:6px;font-size:14px;font-weight:500;">View Full 360</a>
   </div>` : ""}
   <div style="margin-top: 24px; padding: 12px 16px; border-top: 1px solid #E5E7EB; font-size: 12px; color: #9CA3AF;">
     Signal AI — Reply 1 (useful) or 2 (not relevant) to give feedback

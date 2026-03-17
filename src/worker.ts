@@ -29,6 +29,7 @@ import type { AgentDefinition } from "./agents/types.js";
 import { routeSignal, type RecipientInfo } from "./delivery/router.js";
 import { sendEmail, formatSignalEmail } from "./delivery/email.js";
 import { deliverViaWhatsApp } from "./delivery/whatsapp.js";
+import { generate360Url } from "./api/view360-token.js";
 
 // ─── Agent Registry ──────────────────────────────────────────────────────────
 
@@ -301,6 +302,7 @@ const sendSignalWorker = createWorker("send-signal", async (job) => {
         severity: signal.severity,
         customerName: signal.contextSnapshot?.customer?.name ?? "Unknown",
         waConfig: tenant.waConfig as any,
+        view360Url: generate360Url(tenantId, signal.customerId, result.signalId),
       });
     } else {
       // Email delivery via Microsoft Graph
@@ -311,7 +313,8 @@ const sendSignalWorker = createWorker("send-signal", async (job) => {
           signal.body,
           signal.recommendation,
           signal.severity,
-          signal.contextSnapshot?.customer?.name ?? "Unknown"
+          signal.contextSnapshot?.customer?.name ?? "Unknown",
+          { tenantId, customerId: signal.customerId, signalId: result.signalId }
         );
         await sendEmail(
           {
