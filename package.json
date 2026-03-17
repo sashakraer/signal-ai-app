@@ -1,0 +1,49 @@
+{
+  "name": "signal-ai-app",
+  "version": "0.1.0",
+  "description": "Signal AI — AI-powered B2B Customer Intelligence Platform",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src/ --ext .ts",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio",
+    "seed": "tsx scripts/seed.ts",
+    "simulate": "tsx scripts/simulate.ts",
+    "worker": "tsx src/worker.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@azure/msal-node": "^2.16.0",
+    "@fastify/cors": "^10.0.0",
+    "@fastify/rate-limit": "^10.0.0",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
+    "bullmq": "^5.25.0",
+    "dotenv": "^16.4.0",
+    "drizzle-orm": "^0.36.0",
+    "fastify": "^5.2.0",
+    "jsforce": "^3.6.0",
+    "pino": "^9.5.0",
+    "pino-pretty": "^13.0.0",
+    "postgres": "^3.4.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "drizzle-kit": "^0.30.0",
+    "eslint": "^9.0.0",
+    "testcontainers": "^10.16.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
