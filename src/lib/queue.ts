@@ -62,6 +62,34 @@ export const sendSignalQueue = new Queue("send-signal", {
   },
 });
 
+export const syncCalendarQueue = new Queue("sync-calendar", {
+  connection: redisConnection,
+  defaultJobOptions: {
+    removeOnComplete: 100,
+    removeOnFail: 500,
+    attempts: 3,
+    backoff: { type: "exponential", delay: 5000 },
+  },
+});
+
+export const collisionDetectionQueue = new Queue("collision-detection", {
+  connection: redisConnection,
+  defaultJobOptions: {
+    removeOnComplete: 50,
+    removeOnFail: 200,
+    attempts: 2,
+  },
+});
+
+export const escalationCheckQueue = new Queue("escalation-check", {
+  connection: redisConnection,
+  defaultJobOptions: {
+    removeOnComplete: 50,
+    removeOnFail: 200,
+    attempts: 2,
+  },
+});
+
 // ─── Helper to create workers ─────────────────────────────────────────────────
 
 export function createWorker(
