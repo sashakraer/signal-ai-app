@@ -1,5 +1,5 @@
-import type { MiniContext360 } from "@/engine/context-builder";
-import type { DetectedEvent } from "@/engine/event-detector";
+import type { MiniContext360 } from "../engine/context-builder.js";
+import type { DetectedEvent } from "../engine/event-detector.js";
 
 // ─── Signal Types ────────────────────────────────────────────────────────────
 
@@ -38,30 +38,21 @@ export interface SignalOutput {
   scheduledFor: Date;
   triggeringEventId: string | null;
   contextSnapshot: MiniContext360;
-  /** If true, the signal was generated but should not be sent */
   suppressed: boolean;
   suppressionReason: string | null;
 }
 
 // ─── Agent Function Signature ────────────────────────────────────────────────
 
-/**
- * Every agent implements this function signature.
- * It receives an event and context, and returns zero or more signals.
- */
 export type AgentFunction = (
   event: DetectedEvent,
   context: MiniContext360
 ) => Promise<SignalOutput[]>;
 
-// ─── Agent Registration ──────────────────────────────────────────────────────
-
 export interface AgentDefinition {
   name: string;
   description: string;
-  /** Event types this agent handles */
   handles: string[];
-  /** The agent's processing function */
   process: AgentFunction;
 }
 

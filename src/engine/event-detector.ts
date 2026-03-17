@@ -1,33 +1,25 @@
+import { eq, and, lt, gt, sql } from "drizzle-orm";
+import { db } from "../db/index.js";
+import { customers, interactions, tickets, events } from "../db/schema.js";
+import { logger } from "../lib/logger.js";
+import * as thresholds from "./thresholds.js";
+
 // ─── Event Types ─────────────────────────────────────────────────────────────
 
 export enum EventType {
-  /** New email received from or sent to a customer contact */
   EMAIL_RECEIVED = "email_received",
-  /** Calendar meeting scheduled with customer contacts */
   MEETING_SCHEDULED = "meeting_scheduled",
-  /** Significant change in sentiment detected */
   SENTIMENT_CHANGE = "sentiment_change",
-  /** Potential multi-rep collision on same customer */
   COLLISION = "collision",
-  /** Support ticket aged past threshold */
   TICKET_AGED = "ticket_aged",
-  /** Critical support ticket opened or escalated */
   TICKET_CRITICAL = "ticket_critical",
-  /** Renewal date approaching within threshold */
   RENEWAL_APPROACHING = "renewal_approaching",
-  /** Deal stage changed in CRM */
   STAGE_CHANGE = "stage_change",
-  /** Usage metrics declined past threshold */
   USAGE_DECLINE = "usage_decline",
-  /** Contact gap — no interaction past threshold for tier */
   CONTACT_GAP = "contact_gap",
-  /** Competitor mention detected in communications */
   COMPETITOR_MENTION = "competitor_mention",
-  /** Fiscal year end approaching for customer */
   FISCAL_YEAR_END = "fiscal_year_end",
-  /** Seat utilization near capacity */
   SEAT_UTILIZATION = "seat_utilization",
-  /** Multiple tickets on same topic */
   RECURRING_TICKETS = "recurring_tickets",
 }
 
@@ -42,44 +34,319 @@ export interface DetectedEvent {
 
 export interface DetectionContext {
   tenantId: string;
-  /** Time window to look back for pattern detection */
   lookbackMinutes?: number;
 }
 
-// ─── Detector ────────────────────────────────────────────────────────────────
+// ─── Main Detector ───────────────────────────────────────────────────────────
 
 /**
- * Main event detection pipeline. Scans recent data for threshold breaches
- * and pattern matches, emitting events for agent processing.
+ * Main event detection pipeline. Scans data for threshold breaches
+ * and emits events for agent processing.
  */
 export async function detectEvents(ctx: DetectionContext): Promise<DetectedEvent[]> {
-  const events: DetectedEvent[] = [];
+  const { tenantId } = ctx;
+  const log = logger.child({ tenantId, job: "event-detector" });
 
-  // TODO: Run each detector in parallel:
-  // 1. detectContactGaps(ctx) — check last interaction dates vs tier thresholds
-  // 2. detectTicketAging(ctx) — check open tickets vs aging thresholds
-  // 3. detectRenewalApproaching(ctx) — check renewal dates vs window
-  // 4. detectUsageDecline(ctx) — check usage metrics vs decline thresholds
-  // 5. detectSentimentChanges(ctx) — check recent sentiment scores
-  // 6. detectCollisions(ctx) — check for multi-rep outreach to same customer
-  // 7. detectCompetitorMentions(ctx) — scan recent interactions for competitor names
-  // 8. detectSeatUtilization(ctx) — check seat usage percentages
-  // 9. detectRecurringTickets(ctx) — cluster tickets by topic
+  const detectors = [
+    detectContactGaps(tenantId),
+    detectTicketAging(tenantId),
+    detectRenewalApproaching(tenantId),
+    detectOpenTicketVolume(tenantId),
+  ];
 
-  throw new Error("Not implemented");
+  const results = await Promise.allSettled(detectors);
+  const allEvents: DetectedEvent[] = [];
+
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      allEvents.push(...result.value);
+    } else {
+      log.error({ error: result.reason }, "Detector failed");
+    }
+  }
+
+  // Persist detected events
+  for (const event of allEvents) {
+    try {
+      await db.insert(events).values({
+        tenantId: event.tenantId,
+        customerId: event.customerId,
+        type: event.type,
+        source: event.source,
+        occurredAt: event.occurredAt,
+        data: event.data,
+      });
+    } catch {
+      log.debug({ type: event.type, customerId: event.customerId }, "Event insert skipped");
+    }
+  }
+
+  log.info({ eventCount: allEvents.length }, "Event detection completed");
+  return allEvents;
 }
 
 /**
  * Detect events from a single new interaction (real-time path).
- * Called when a new email/meeting is ingested, for immediate event detection.
  */
 export async function detectEventsFromInteraction(
   interactionId: string,
   ctx: DetectionContext
 ): Promise<DetectedEvent[]> {
-  // TODO: Load the interaction, check for:
-  // - Sentiment below threshold
-  // - Competitor mentions in body
-  // - Collision with recent outreach from other employees
-  throw new Error("Not implemented");
+  const detectedEvents: DetectedEvent[] = [];
+  const { tenantId } = ctx;
+
+  const rows = await db
+    .select()
+    .from(interactions)
+    .where(
+      and(eq(interactions.tenantId, tenantId), eq(interactions.id, interactionId))
+    )
+    .limit(1);
+
+  if (rows.length === 0) return [];
+  const interaction = rows[0];
+
+  if (interaction.type === "meeting") {
+    detectedEvents.push({
+      type: EventType.MEETING_SCHEDULED,
+      tenantId,
+      customerId: interaction.customerId,
+      occurredAt: interaction.occurredAt,
+      source: "interaction",
+      data: {
+        interactionId: interaction.id,
+        subject: interaction.subject,
+        employeeId: interaction.employeeId,
+      },
+    });
+  } else if (interaction.type === "email") {
+    detectedEvents.push({
+      type: EventType.EMAIL_RECEIVED,
+      tenantId,
+      customerId: interaction.customerId,
+      occurredAt: interaction.occurredAt,
+      source: "interaction",
+      data: {
+        interactionId: interaction.id,
+        subject: interaction.subject,
+        direction: interaction.direction,
+        employeeId: interaction.employeeId,
+      },
+    });
+  }
+
+  // Sentiment threshold check
+  if (
+    interaction.sentiment != null &&
+    interaction.sentiment < thresholds.SENTIMENT_YELLOW_THRESHOLD
+  ) {
+    detectedEvents.push({
+      type: EventType.SENTIMENT_CHANGE,
+      tenantId,
+      customerId: interaction.customerId,
+      occurredAt: interaction.occurredAt,
+      source: "interaction",
+      data: {
+        interactionId: interaction.id,
+        sentiment: interaction.sentiment,
+        sentimentLabel: interaction.sentimentLabel,
+      },
+    });
+  }
+
+  return detectedEvents;
+}
+
+// ─── Individual Detectors ────────────────────────────────────────────────────
+
+async function detectContactGaps(tenantId: string): Promise<DetectedEvent[]> {
+  const detectedEvents: DetectedEvent[] = [];
+  const now = new Date();
+
+  const customerRows = await db
+    .select({ id: customers.id, name: customers.name, tier: customers.tier })
+    .from(customers)
+    .where(eq(customers.tenantId, tenantId));
+
+  for (const customer of customerRows) {
+    const tier = customer.tier ?? "medium";
+    const gapThresholds = thresholds.getContactGapThresholds(tier);
+
+    const lastInteraction = await db
+      .select({ occurredAt: interactions.occurredAt })
+      .from(interactions)
+      .where(
+        and(
+          eq(interactions.tenantId, tenantId),
+          eq(interactions.customerId, customer.id)
+        )
+      )
+      .orderBy(sql`occurred_at DESC`)
+      .limit(1);
+
+    if (lastInteraction.length === 0) continue;
+
+    const daysSince = Math.floor(
+      (now.getTime() - lastInteraction[0].occurredAt.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    const severity =
+      daysSince >= gapThresholds.redDays
+        ? "red"
+        : daysSince >= gapThresholds.yellowDays
+          ? "yellow"
+          : null;
+
+    if (severity) {
+      detectedEvents.push({
+        type: EventType.CONTACT_GAP,
+        tenantId,
+        customerId: customer.id,
+        occurredAt: now,
+        source: "scheduled_scan",
+        data: {
+          daysSinceContact: daysSince,
+          tier,
+          severity,
+          customerName: customer.name,
+          thresholdDays: severity === "red" ? gapThresholds.redDays : gapThresholds.yellowDays,
+        },
+      });
+    }
+  }
+
+  return detectedEvents;
+}
+
+async function detectTicketAging(tenantId: string): Promise<DetectedEvent[]> {
+  const detectedEvents: DetectedEvent[] = [];
+  const now = new Date();
+
+  const openTickets = await db
+    .select({
+      id: tickets.id,
+      customerId: tickets.customerId,
+      subject: tickets.subject,
+      priority: tickets.priority,
+      openedAt: tickets.openedAt,
+    })
+    .from(tickets)
+    .where(and(eq(tickets.tenantId, tenantId), eq(tickets.status, "open")));
+
+  for (const ticket of openTickets) {
+    const ageDays = Math.floor(
+      (now.getTime() - ticket.openedAt.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    if (ticket.priority === "high" && ageDays >= thresholds.TICKET_HIGH_PRIORITY_RED_DAYS) {
+      detectedEvents.push({
+        type: EventType.TICKET_CRITICAL,
+        tenantId,
+        customerId: ticket.customerId,
+        occurredAt: now,
+        source: "scheduled_scan",
+        data: { ticketId: ticket.id, subject: ticket.subject, priority: ticket.priority, ageDays, severity: "red" },
+      });
+    } else if (ageDays >= thresholds.TICKET_AGING_YELLOW_DAYS) {
+      detectedEvents.push({
+        type: EventType.TICKET_AGED,
+        tenantId,
+        customerId: ticket.customerId,
+        occurredAt: now,
+        source: "scheduled_scan",
+        data: { ticketId: ticket.id, subject: ticket.subject, priority: ticket.priority, ageDays, severity: "yellow" },
+      });
+    }
+  }
+
+  return detectedEvents;
+}
+
+async function detectRenewalApproaching(tenantId: string): Promise<DetectedEvent[]> {
+  const detectedEvents: DetectedEvent[] = [];
+  const now = new Date();
+  const windowEnd = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
+
+  const renewingCustomers = await db
+    .select({
+      id: customers.id,
+      name: customers.name,
+      renewalDate: customers.renewalDate,
+      arr: customers.arr,
+      healthScore: customers.healthScore,
+    })
+    .from(customers)
+    .where(
+      and(
+        eq(customers.tenantId, tenantId),
+        gt(customers.renewalDate, now.toISOString().split("T")[0]),
+        lt(customers.renewalDate, windowEnd.toISOString().split("T")[0])
+      )
+    );
+
+  for (const customer of renewingCustomers) {
+    if (!customer.renewalDate) continue;
+    const renewalDate = new Date(customer.renewalDate);
+    const daysUntilRenewal = Math.floor(
+      (renewalDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    const milestones = [90, 60, 30, 14, 7];
+    const matchedMilestone = milestones.find(
+      (m) => daysUntilRenewal <= m && daysUntilRenewal > m - 1
+    );
+
+    if (matchedMilestone) {
+      detectedEvents.push({
+        type: EventType.RENEWAL_APPROACHING,
+        tenantId,
+        customerId: customer.id,
+        occurredAt: now,
+        source: "scheduled_scan",
+        data: {
+          daysUntilRenewal,
+          renewalDate: customer.renewalDate,
+          arr: customer.arr,
+          healthScore: customer.healthScore,
+          customerName: customer.name,
+          milestone: matchedMilestone,
+        },
+      });
+    }
+  }
+
+  return detectedEvents;
+}
+
+async function detectOpenTicketVolume(tenantId: string): Promise<DetectedEvent[]> {
+  const detectedEvents: DetectedEvent[] = [];
+  const now = new Date();
+
+  const ticketCounts = await db
+    .select({
+      customerId: tickets.customerId,
+      count: sql<number>`count(*)::int`,
+    })
+    .from(tickets)
+    .where(and(eq(tickets.tenantId, tenantId), eq(tickets.status, "open")))
+    .groupBy(tickets.customerId);
+
+  for (const row of ticketCounts) {
+    if (row.count >= thresholds.TICKET_OPEN_COUNT_ORANGE) {
+      detectedEvents.push({
+        type: EventType.TICKET_CRITICAL,
+        tenantId,
+        customerId: row.customerId,
+        occurredAt: now,
+        source: "scheduled_scan",
+        data: {
+          openTicketCount: row.count,
+          threshold: thresholds.TICKET_OPEN_COUNT_ORANGE,
+          severity: "orange",
+        },
+      });
+    }
+  }
+
+  return detectedEvents;
 }

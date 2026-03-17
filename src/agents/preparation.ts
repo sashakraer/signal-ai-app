@@ -1,41 +1,84 @@
-import type { AgentDefinition, SignalOutput } from "./types";
-import type { MiniContext360 } from "@/engine/context-builder";
-import type { DetectedEvent } from "@/engine/event-detector";
-import { EventType } from "@/engine/event-detector";
+import type { AgentDefinition, SignalOutput } from "./types.js";
+import type { MiniContext360 } from "../engine/context-builder.js";
+import type { DetectedEvent } from "../engine/event-detector.js";
+import { EventType } from "../engine/event-detector.js";
+import { generateSignalDraft } from "../engine/intelligence.js";
 
 // ─── Timing Constants ────────────────────────────────────────────────────────
 
-/** Hours before meeting to send a deep brief */
 export const DEEP_BRIEF_HOURS_BEFORE = 24;
-
-/** Hours before meeting to send a quick brief */
 export const QUICK_BRIEF_HOURS_BEFORE = 2;
-
-/** Minimum meeting duration in minutes to warrant a brief */
 export const MIN_MEETING_DURATION_MINUTES = 15;
+
+// ─── Prompts ─────────────────────────────────────────────────────────────────
+
+const DEEP_BRIEF_PROMPT = `You are the Preparation Agent generating a Deep Brief for an upcoming customer meeting.
+
+Your brief should include:
+1. **Customer Snapshot**: Health score, ARR, renewal date, current products
+2. **Relationship Status**: Key contacts attending, their influence level, last interaction
+3. **Active Issues**: Open tickets, their age and priority
+4. **Deal Status**: Any active deals, stage, amount, close date
+5. **Recent History**: Summary of last 5 interactions and their sentiment trend
+6. **Talking Points**: 3-5 specific topics the recipient should raise
+7. **Risks & Opportunities**: Any signals that require attention
+
+Format the body as a structured brief the recipient can scan in 2 minutes.`;
+
+const QUICK_BRIEF_PROMPT = `You are the Preparation Agent generating a Quick Brief for a meeting starting soon.
+
+Keep it brief (3-4 bullet points):
+1. Any updates since the last brief or in the last 24 hours
+2. Key reminder of the most important topic to address
+3. One specific data point to reference in the meeting
+
+Format as a quick-scan list. No need for full context — the recipient already has the deep brief.`;
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
 
-/**
- * Preparation Agent: generates meeting briefs for upcoming customer meetings.
- *
- * - Deep Brief: sent ~24h before, includes full context, history, and recommendations
- * - Quick Brief: sent ~2h before, includes latest updates since the deep brief
- */
 async function process(
   event: DetectedEvent,
   context: MiniContext360
 ): Promise<SignalOutput[]> {
-  // TODO: Implementation steps:
-  // 1. Extract meeting details from event.data (start time, attendees, subject)
-  // 2. Determine if meeting is with an external customer contact
-  // 3. Calculate timing: is this a deep brief window or quick brief window?
-  // 4. Check if a deep brief was already sent for this meeting
-  // 5. Identify the recipient (CSM or meeting organizer)
-  // 6. Build prompt with context and call intelligence.generateSignalDraft()
-  // 7. Return SignalOutput with appropriate scheduling
+  const meetingStart = event.data.startTime
+    ? new Date(event.data.startTime as string)
+    : event.occurredAt;
 
-  throw new Error("Not implemented");
+  const briefType = determineBriefType(meetingStart);
+  if (!briefType) return [];
+
+  // Determine recipient — CSM is primary, fallback to meeting organizer
+  const recipientId = context.csm?.id ?? (event.data.employeeId as string);
+  if (!recipientId) return [];
+
+  const prompt = briefType === "deep_brief" ? DEEP_BRIEF_PROMPT : QUICK_BRIEF_PROMPT;
+  const draft = await generateSignalDraft(prompt, context, event.data);
+
+  // Schedule: deep brief at 08:00 day before, quick brief 2h before
+  const scheduledFor = briefType === "deep_brief"
+    ? getDeepBriefTime(meetingStart)
+    : getQuickBriefTime(meetingStart);
+
+  return [
+    {
+      tenantId: event.tenantId,
+      customerId: event.customerId!,
+      type: "meeting_prep",
+      subtype: briefType,
+      severity: draft.severity,
+      agent: "preparation",
+      recipientEmployeeId: recipientId,
+      channel: "email",
+      title: draft.title,
+      body: draft.body,
+      recommendation: draft.recommendation,
+      scheduledFor,
+      triggeringEventId: null,
+      contextSnapshot: context,
+      suppressed: false,
+      suppressionReason: null,
+    },
+  ];
 }
 
 /**
@@ -48,10 +91,21 @@ export function determineBriefType(
   const hoursUntilMeeting =
     (meetingStartTime.getTime() - now.getTime()) / (1000 * 60 * 60);
 
-  if (hoursUntilMeeting <= 0) return null; // Meeting already started
+  if (hoursUntilMeeting <= 0) return null;
   if (hoursUntilMeeting <= QUICK_BRIEF_HOURS_BEFORE + 1) return "quick_brief";
   if (hoursUntilMeeting <= DEEP_BRIEF_HOURS_BEFORE + 1) return "deep_brief";
-  return null; // Too far out
+  return null;
+}
+
+function getDeepBriefTime(meetingStart: Date): Date {
+  const brief = new Date(meetingStart);
+  brief.setDate(brief.getDate() - 1);
+  brief.setHours(8, 0, 0, 0);
+  return brief;
+}
+
+function getQuickBriefTime(meetingStart: Date): Date {
+  return new Date(meetingStart.getTime() - QUICK_BRIEF_HOURS_BEFORE * 60 * 60 * 1000);
 }
 
 export const preparationAgent: AgentDefinition = {

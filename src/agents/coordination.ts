@@ -1,75 +1,80 @@
-import type { AgentDefinition, SignalOutput } from "./types";
-import type { MiniContext360 } from "@/engine/context-builder";
-import type { DetectedEvent } from "@/engine/event-detector";
-import { EventType } from "@/engine/event-detector";
+import type { AgentDefinition, SignalOutput } from "./types.js";
+import type { MiniContext360 } from "../engine/context-builder.js";
+import type { DetectedEvent } from "../engine/event-detector.js";
+import { EventType } from "../engine/event-detector.js";
+import { generateSignalDraft } from "../engine/intelligence.js";
+import { eq, and, gt } from "drizzle-orm";
+import { db } from "../db/index.js";
+import { interactions } from "../db/schema.js";
 
 // ─── Collision Types ─────────────────────────────────────────────────────────
 
-/**
- * Type A: Two reps reaching out to the same contact within a short window.
- * Type B: Conflicting messages — one rep offers a discount while another pushes upsell.
- * Type C: Support and Sales both contacting during an open escalation.
- * Type D: Manager/exec reaching out without CSM awareness.
- */
 export enum CollisionType {
-  /** Two reps reaching out to the same contact within a short window */
   TYPE_A_DUPLICATE_OUTREACH = "type_a",
-  /** Conflicting messages from different reps */
   TYPE_B_CONFLICTING_MESSAGES = "type_b",
-  /** Support and Sales both contacting during an open escalation */
   TYPE_C_SUPPORT_SALES_OVERLAP = "type_c",
-  /** Manager/exec outreach without CSM awareness */
   TYPE_D_EXEC_BYPASS = "type_d",
 }
 
 export interface CollisionDetail {
   type: CollisionType;
-  /** Employee IDs involved in the collision */
   employeeIds: string[];
-  /** Contact ID that received duplicate outreach */
   contactId: string | null;
-  /** Description of the conflict */
   description: string;
 }
 
-// ─── Detection Windows ──────────────────────────────────────────────────────
-
-/** Hours within which duplicate outreach to same contact is a collision */
 export const DUPLICATE_OUTREACH_WINDOW_HOURS = 24;
-
-/** Hours to look back for conflicting message detection */
 export const CONFLICTING_MESSAGE_WINDOW_HOURS = 48;
+
+// ─── Prompt ──────────────────────────────────────────────────────────────────
+
+const COORDINATION_PROMPT = `You are the Coordination Agent detecting multi-rep collisions on the same customer.
+
+Generate a signal that:
+1. Clearly identifies who is contacting whom and when
+2. Explains the risk of uncoordinated outreach (confusion, conflicting messages)
+3. Recommends who should proceed and who should hold
+4. If applicable, suggests a quick sync between the involved parties
+
+Be diplomatic — the goal is coordination, not blame.`;
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
 
-/**
- * Coordination Agent: detects multi-rep collisions on the same customer.
- *
- * Monitors outreach patterns and alerts when multiple employees
- * contact the same customer/contact in ways that could cause confusion.
- */
 async function process(
   event: DetectedEvent,
   context: MiniContext360
 ): Promise<SignalOutput[]> {
-  // TODO: Implementation steps:
-  // 1. Determine collision type from event data
-  // 2. Identify all employees involved
-  // 3. Determine who should be notified:
-  //    - Type A: Both reps + CSM
-  //    - Type B: Both reps + their managers
-  //    - Type C: Support lead + Sales rep + CSM
-  //    - Type D: CSM (primary notification)
-  // 4. Build collision-specific context for Claude prompt
-  // 5. Generate signal with recommendation (who should proceed, who should hold)
-  // 6. Return one SignalOutput per recipient
+  const collision = event.data as unknown as CollisionDetail;
+  if (!collision.employeeIds || collision.employeeIds.length === 0) return [];
 
-  throw new Error("Not implemented");
+  const draft = await generateSignalDraft(COORDINATION_PROMPT, context, event.data);
+
+  // Send to all involved employees + CSM
+  const recipientIds = new Set(collision.employeeIds);
+  if (context.csm) recipientIds.add(context.csm.id);
+
+  return [...recipientIds].map((recipientId) => ({
+    tenantId: event.tenantId,
+    customerId: event.customerId!,
+    type: "collision" as const,
+    subtype: collision.type as any,
+    severity: "medium" as const,
+    agent: "coordination",
+    recipientEmployeeId: recipientId,
+    channel: "email" as const,
+    title: draft.title,
+    body: draft.body,
+    recommendation: draft.recommendation,
+    scheduledFor: new Date(),
+    triggeringEventId: null,
+    contextSnapshot: context,
+    suppressed: false,
+    suppressionReason: null,
+  }));
 }
 
 /**
- * Detect if a new outreach creates a collision with recent activity.
- * Called in real-time when a new email or meeting is detected.
+ * Check if a new outreach creates a collision with recent activity.
  */
 export async function checkForCollision(
   tenantId: string,
@@ -77,18 +82,64 @@ export async function checkForCollision(
   customerId: string,
   contactId: string | null
 ): Promise<CollisionDetail | null> {
-  // TODO: Query recent interactions for this customer:
-  // 1. Find outreach from OTHER employees to same contact within window
-  // 2. Check for open support escalations (Type C)
-  // 3. Check if the employee is a manager/exec bypassing CSM (Type D)
-  // 4. Return the most severe collision found, or null
+  const windowStart = new Date(
+    Date.now() - DUPLICATE_OUTREACH_WINDOW_HOURS * 60 * 60 * 1000
+  );
 
-  throw new Error("Not implemented");
+  // Find recent outbound interactions from OTHER employees to the same customer
+  const recentOutreach = await db
+    .select({
+      employeeId: interactions.employeeId,
+      contactId: interactions.contactId,
+      occurredAt: interactions.occurredAt,
+      subject: interactions.subject,
+    })
+    .from(interactions)
+    .where(
+      and(
+        eq(interactions.tenantId, tenantId),
+        eq(interactions.customerId, customerId),
+        eq(interactions.direction, "outbound"),
+        gt(interactions.occurredAt, windowStart)
+      )
+    );
+
+  // Filter to other employees' outreach
+  const otherOutreach = recentOutreach.filter(
+    (r) => r.employeeId && r.employeeId !== employeeId
+  );
+
+  if (otherOutreach.length === 0) return null;
+
+  // Type A: Same contact contacted by different reps
+  if (contactId) {
+    const sameContact = otherOutreach.filter((r) => r.contactId === contactId);
+    if (sameContact.length > 0) {
+      return {
+        type: CollisionType.TYPE_A_DUPLICATE_OUTREACH,
+        employeeIds: [employeeId, ...sameContact.map((r) => r.employeeId!)],
+        contactId,
+        description: `Multiple reps contacted the same contact within ${DUPLICATE_OUTREACH_WINDOW_HOURS}h`,
+      };
+    }
+  }
+
+  // Type A fallback: Same customer contacted by different reps
+  if (otherOutreach.length > 0) {
+    return {
+      type: CollisionType.TYPE_A_DUPLICATE_OUTREACH,
+      employeeIds: [employeeId, ...otherOutreach.map((r) => r.employeeId!)],
+      contactId: null,
+      description: `Multiple reps contacted the same customer within ${DUPLICATE_OUTREACH_WINDOW_HOURS}h`,
+    };
+  }
+
+  return null;
 }
 
 export const coordinationAgent: AgentDefinition = {
   name: "coordination",
-  description: "Detects multi-rep collisions and coordinates outreach to prevent customer confusion",
+  description: "Detects multi-rep collisions and coordinates outreach",
   handles: [EventType.COLLISION],
   process,
 };

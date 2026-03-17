@@ -1,8 +1,9 @@
-import type { AgentDefinition, SignalOutput, Severity } from "./types";
-import type { MiniContext360 } from "@/engine/context-builder";
-import type { DetectedEvent } from "@/engine/event-detector";
-import { EventType } from "@/engine/event-detector";
-import * as thresholds from "@/engine/thresholds";
+import type { AgentDefinition, SignalOutput, Severity } from "./types.js";
+import type { MiniContext360 } from "../engine/context-builder.js";
+import type { DetectedEvent } from "../engine/event-detector.js";
+import { EventType } from "../engine/event-detector.js";
+import { generateSignalDraft } from "../engine/intelligence.js";
+import * as thresholds from "../engine/thresholds.js";
 
 // ─── Risk Categories ─────────────────────────────────────────────────────────
 
@@ -14,33 +15,91 @@ export type RiskCategory =
   | "competitor_threat"
   | "renewal_risk";
 
+// ─── Escalation Timers ──────────────────────────────────────────────────────
+
+const ESCALATION_HOURS: Record<Severity, number | null> = {
+  low: null,
+  medium: null,
+  high: 48,
+  critical: 24,
+};
+
+// ─── Prompt ──────────────────────────────────────────────────────────────────
+
+const RISK_PROMPT = `You are the Risk Agent identifying churn risk for a B2B customer.
+
+Analyze the risk indicators and generate a signal that:
+1. Clearly states the risk type and what triggered it
+2. Provides context (how long, how severe, what changed)
+3. References specific data points (dates, scores, counts)
+4. Gives a concrete action the recipient should take within 24-48 hours
+5. If renewal is approaching, emphasize the urgency
+
+Be direct and actionable. CSMs need to know exactly what to do.`;
+
 // ─── Agent ───────────────────────────────────────────────────────────────────
 
-/**
- * Risk Agent: detects and alerts on churn risk indicators.
- *
- * Monitors:
- * - Usage decline patterns
- * - Contact gaps (silence from key accounts)
- * - Ticket aging and volume
- * - Sentiment deterioration
- * - Competitor mentions
- * - Renewal proximity combined with negative signals
- */
 async function process(
   event: DetectedEvent,
   context: MiniContext360
 ): Promise<SignalOutput[]> {
-  // TODO: Implementation steps:
-  // 1. Determine risk category from event type
-  // 2. Assess severity using thresholds
-  // 3. Check if a similar risk signal was recently sent (dedup window)
-  // 4. Determine recipient: CSM for operational risks, manager for escalations
-  // 5. Build prompt with risk-specific context and call intelligence.generateSignalDraft()
-  // 6. For critical severity, add escalation due date
-  // 7. Return SignalOutput(s)
+  const category = eventToCategory(event.type);
+  if (!category) return [];
 
-  throw new Error("Not implemented");
+  const severity = assessSeverity(category, context, event.data);
+
+  // Determine recipients based on severity
+  const recipients: string[] = [];
+  if (context.csm) recipients.push(context.csm.id);
+  if (severity === "high" || severity === "critical") {
+    if (context.ae) recipients.push(context.ae.id);
+  }
+
+  if (recipients.length === 0) return [];
+
+  const draft = await generateSignalDraft(RISK_PROMPT, context, {
+    ...event.data,
+    riskCategory: category,
+    assessedSeverity: severity,
+  });
+
+  const escalationHours = ESCALATION_HOURS[severity];
+  const escalationDueAt = escalationHours
+    ? new Date(Date.now() + escalationHours * 60 * 60 * 1000)
+    : undefined;
+
+  return recipients.map((recipientId) => ({
+    tenantId: event.tenantId,
+    customerId: event.customerId!,
+    type: "risk" as const,
+    subtype: null,
+    severity,
+    agent: "risk",
+    recipientEmployeeId: recipientId,
+    channel: "email" as const,
+    title: draft.title,
+    body: draft.body,
+    recommendation: draft.recommendation,
+    scheduledFor: new Date(),
+    triggeringEventId: null,
+    contextSnapshot: context,
+    suppressed: false,
+    suppressionReason: null,
+    ...(escalationDueAt ? { escalationDueAt } : {}),
+  }));
+}
+
+function eventToCategory(type: EventType): RiskCategory | null {
+  const map: Partial<Record<EventType, RiskCategory>> = {
+    [EventType.USAGE_DECLINE]: "usage_decline",
+    [EventType.CONTACT_GAP]: "contact_gap",
+    [EventType.TICKET_AGED]: "ticket_aging",
+    [EventType.TICKET_CRITICAL]: "ticket_aging",
+    [EventType.SENTIMENT_CHANGE]: "sentiment_drop",
+    [EventType.COMPETITOR_MENTION]: "competitor_threat",
+    [EventType.RENEWAL_APPROACHING]: "renewal_risk",
+  };
+  return map[type] ?? null;
 }
 
 /**
@@ -51,20 +110,67 @@ export function assessSeverity(
   context: MiniContext360,
   eventData: Record<string, unknown>
 ): Severity {
-  // TODO: Implement severity logic per category:
-  // - usage_decline: yellow if count <= 3, red if >15% + renewal < 30d
-  // - contact_gap: based on tier thresholds from thresholds.ts
-  // - ticket_aging: yellow at 14d, orange at 3+ open, red for HIGH 7+ days
-  // - sentiment_drop: yellow < 0.3, orange 2+ in 14d, red competitor
-  // - competitor_threat: always red
-  // - renewal_risk: compound of other factors near renewal date
+  switch (category) {
+    case "usage_decline": {
+      const percentDecline = (eventData.percentDecline as number) ?? 0;
+      const daysToRenewal = getDaysToRenewal(context);
+      if (
+        percentDecline >= thresholds.USAGE_DECLINE_PERCENT_RED &&
+        daysToRenewal != null &&
+        daysToRenewal <= thresholds.USAGE_DECLINE_RENEWAL_PROXIMITY_RED_DAYS
+      ) {
+        return "critical";
+      }
+      if (percentDecline >= thresholds.USAGE_DECLINE_PERCENT_YELLOW) return "high";
+      return "medium";
+    }
 
-  throw new Error("Not implemented");
+    case "contact_gap": {
+      const severity = eventData.severity as string;
+      if (severity === "red") return "high";
+      return "medium";
+    }
+
+    case "ticket_aging": {
+      const severity = eventData.severity as string;
+      const openCount = (eventData.openTicketCount as number) ?? 1;
+      if (severity === "red") return "high";
+      if (openCount >= thresholds.TICKET_OPEN_COUNT_ORANGE) return "high";
+      return "medium";
+    }
+
+    case "sentiment_drop": {
+      const sentiment = (eventData.sentiment as number) ?? 0;
+      if (sentiment < -0.5) return "high";
+      return "medium";
+    }
+
+    case "competitor_threat":
+      return "critical";
+
+    case "renewal_risk": {
+      const daysToRenewal = (eventData.daysUntilRenewal as number) ?? 90;
+      const healthScore = context.customer.healthScore;
+      if (daysToRenewal <= 14 && healthScore < 40) return "critical";
+      if (daysToRenewal <= 30 && healthScore < 50) return "high";
+      if (daysToRenewal <= 60) return "medium";
+      return "low";
+    }
+
+    default:
+      return "medium";
+  }
+}
+
+function getDaysToRenewal(context: MiniContext360): number | null {
+  if (!context.customer.renewalDate) return null;
+  const renewal = new Date(context.customer.renewalDate);
+  return Math.floor((renewal.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
 }
 
 export const riskAgent: AgentDefinition = {
   name: "risk",
-  description: "Detects and alerts on customer churn risk indicators across multiple dimensions",
+  description: "Detects and alerts on customer churn risk indicators",
   handles: [
     EventType.USAGE_DECLINE,
     EventType.CONTACT_GAP,

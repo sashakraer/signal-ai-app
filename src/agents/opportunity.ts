@@ -1,52 +1,95 @@
-import type { AgentDefinition, SignalOutput, SuppressionCheckResult } from "./types";
-import type { MiniContext360 } from "@/engine/context-builder";
-import type { DetectedEvent } from "@/engine/event-detector";
-import { EventType } from "@/engine/event-detector";
-import * as thresholds from "@/engine/thresholds";
+import { eq, and, gt } from "drizzle-orm";
+import type { AgentDefinition, SignalOutput, SuppressionCheckResult } from "./types.js";
+import type { MiniContext360 } from "../engine/context-builder.js";
+import type { DetectedEvent } from "../engine/event-detector.js";
+import { EventType } from "../engine/event-detector.js";
+import { generateSignalDraft } from "../engine/intelligence.js";
+import { db } from "../db/index.js";
+import { signals } from "../db/schema.js";
 
 // ─── Opportunity Categories ──────────────────────────────────────────────────
 
 export type OpportunityCategory =
-  | "expansion"       // Seat utilization high -> upsell seats
-  | "ticket_addon"    // Recurring tickets on a feature gap -> sell add-on
-  | "knowledge_gap"   // No training/enablement in 60 days -> offer services
-  | "budget_timing";  // Fiscal year end approaching -> propose before budget freeze
+  | "expansion"
+  | "ticket_addon"
+  | "knowledge_gap"
+  | "budget_timing";
+
+// ─── Prompt ──────────────────────────────────────────────────────────────────
+
+const OPPORTUNITY_PROMPT = `You are the Opportunity Agent identifying expansion and upsell opportunities for a B2B customer.
+
+Generate a signal that:
+1. Identifies the specific opportunity type and what triggered it
+2. Provides supporting evidence (usage data, ticket patterns, timing)
+3. Suggests a specific next step for the AE or CSM
+4. Frames the opportunity in terms of customer value, not just revenue
+
+Keep the tone consultative — this is about helping the customer succeed, which drives growth.`;
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
 
-/**
- * Opportunity Agent: identifies expansion and upsell opportunities.
- *
- * Monitors:
- * - Seat utilization approaching capacity (>=85%)
- * - Recurring support tickets suggesting feature needs
- * - Knowledge/training gaps
- * - Fiscal year timing for budget conversations
- */
 async function process(
   event: DetectedEvent,
   context: MiniContext360
 ): Promise<SignalOutput[]> {
-  // TODO: Implementation steps:
-  // 1. Categorize opportunity from event type
-  // 2. Run suppression check — skip if customer health is critical
-  // 3. Check for active deal on this customer (avoid duplicate opportunity signals)
-  // 4. Determine recipient: AE for expansion, CSM for knowledge gap
-  // 5. Build opportunity-specific prompt and call intelligence.generateSignalDraft()
-  // 6. Set appropriate severity (opportunities are typically medium)
-  // 7. Return SignalOutput with suppression status
+  const category = eventToCategory(event.type);
+  if (!category) return [];
 
-  throw new Error("Not implemented");
+  // Check suppression rules
+  const suppression = await checkSuppression(
+    event.tenantId,
+    event.customerId!,
+    category,
+    context
+  );
+
+  const draft = await generateSignalDraft(OPPORTUNITY_PROMPT, context, {
+    ...event.data,
+    opportunityCategory: category,
+  });
+
+  // Route to AE for expansion/budget, CSM for knowledge gap/ticket addon
+  const recipientId =
+    category === "expansion" || category === "budget_timing"
+      ? (context.ae?.id ?? context.csm?.id)
+      : (context.csm?.id ?? context.ae?.id);
+
+  if (!recipientId) return [];
+
+  return [
+    {
+      tenantId: event.tenantId,
+      customerId: event.customerId!,
+      type: "opportunity",
+      subtype: category,
+      severity: "medium",
+      agent: "opportunity",
+      recipientEmployeeId: recipientId,
+      channel: "email" as const,
+      title: draft.title,
+      body: draft.body,
+      recommendation: draft.recommendation,
+      scheduledFor: new Date(),
+      triggeringEventId: null,
+      contextSnapshot: context,
+      suppressed: suppression.suppressed,
+      suppressionReason: suppression.reason,
+    },
+  ];
+}
+
+function eventToCategory(type: EventType): OpportunityCategory | null {
+  const map: Partial<Record<EventType, OpportunityCategory>> = {
+    [EventType.SEAT_UTILIZATION]: "expansion",
+    [EventType.RECURRING_TICKETS]: "ticket_addon",
+    [EventType.FISCAL_YEAR_END]: "budget_timing",
+  };
+  return map[type] ?? null;
 }
 
 /**
  * Check if an opportunity signal should be suppressed.
- *
- * Suppression rules:
- * - Customer health score < 30: suppress (focus on retention, not upsell)
- * - Active critical risk signal in last 7 days: suppress
- * - Similar opportunity signal sent in last 30 days: suppress (dedup)
- * - Customer explicitly flagged as "no outreach": suppress
  */
 export async function checkSuppression(
   tenantId: string,
@@ -54,8 +97,6 @@ export async function checkSuppression(
   category: OpportunityCategory,
   context: MiniContext360
 ): Promise<SuppressionCheckResult> {
-  // TODO: Check each suppression rule:
-
   // Rule 1: Health score too low
   if (context.customer.healthScore < 30) {
     return {
@@ -64,20 +105,58 @@ export async function checkSuppression(
     };
   }
 
-  // TODO: Rule 2: Check for active critical risk signals in last 7 days
-  // TODO: Rule 3: Check for duplicate opportunity signal in last 30 days
-  // TODO: Rule 4: Check customer "no outreach" flag
+  // Rule 2: Active critical risk signal in last 7 days
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const recentRiskSignals = await db
+    .select({ id: signals.id })
+    .from(signals)
+    .where(
+      and(
+        eq(signals.tenantId, tenantId),
+        eq(signals.customerId, customerId),
+        eq(signals.type, "risk"),
+        eq(signals.severity, "critical"),
+        gt(signals.createdAt, sevenDaysAgo)
+      )
+    )
+    .limit(1);
+
+  if (recentRiskSignals.length > 0) {
+    return {
+      suppressed: true,
+      reason: "Active critical risk signal — focus on retention, not expansion",
+    };
+  }
+
+  // Rule 3: Duplicate opportunity in last 30 days
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const recentOpportunity = await db
+    .select({ id: signals.id })
+    .from(signals)
+    .where(
+      and(
+        eq(signals.tenantId, tenantId),
+        eq(signals.customerId, customerId),
+        eq(signals.type, "opportunity"),
+        eq(signals.subtype, category),
+        gt(signals.createdAt, thirtyDaysAgo)
+      )
+    )
+    .limit(1);
+
+  if (recentOpportunity.length > 0) {
+    return {
+      suppressed: true,
+      reason: `Similar ${category} opportunity signal sent within last 30 days`,
+    };
+  }
 
   return { suppressed: false, reason: null };
 }
 
 export const opportunityAgent: AgentDefinition = {
   name: "opportunity",
-  description: "Identifies expansion and upsell opportunities based on usage, tickets, and timing",
-  handles: [
-    EventType.SEAT_UTILIZATION,
-    EventType.RECURRING_TICKETS,
-    EventType.FISCAL_YEAR_END,
-  ],
+  description: "Identifies expansion and upsell opportunities",
+  handles: [EventType.SEAT_UTILIZATION, EventType.RECURRING_TICKETS, EventType.FISCAL_YEAR_END],
   process,
 };

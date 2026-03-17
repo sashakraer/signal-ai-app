@@ -56,21 +56,19 @@ export interface MappedInteraction {
  */
 export function mapMessage(
   msg: GraphMessage,
-  monitoredUserEmail: string
+  monitoredUserEmail: string,
+  internalDomains: string[]
 ): MappedInteraction {
   const fromEmail = msg.from.emailAddress.address.toLowerCase();
   const isFromMonitored = fromEmail === monitoredUserEmail.toLowerCase();
-
-  // TODO: Determine direction more accurately:
-  // - If all participants are internal domain -> "internal"
-  // - If from monitored user -> "outbound"
-  // - Otherwise -> "inbound"
-  const direction: MappedInteraction["direction"] = isFromMonitored ? "outbound" : "inbound";
 
   const allRecipients = [
     ...msg.toRecipients.map((r) => r.emailAddress.address.toLowerCase()),
     ...msg.ccRecipients.map((r) => r.emailAddress.address.toLowerCase()),
   ];
+
+  const allParticipants = [fromEmail, ...allRecipients];
+  const direction = detectDirection(isFromMonitored, allParticipants, internalDomains);
 
   return {
     sourceId: msg.internetMessageId || msg.id,
@@ -79,8 +77,8 @@ export function mapMessage(
     direction,
     occurredAt: msg.receivedDateTime,
     subject: msg.subject,
-    bodyText: msg.body?.content ?? null, // TODO: strip HTML if contentType=html
-    participantEmails: [fromEmail, ...allRecipients],
+    bodyText: stripHtml(msg.body?.content, msg.body?.contentType),
+    participantEmails: allParticipants,
     rawMetadata: {
       conversationId: msg.conversationId,
       importance: msg.importance,
@@ -93,15 +91,17 @@ export function mapMessage(
  */
 export function mapCalendarEvent(
   event: GraphCalendarEvent,
-  monitoredUserEmail: string
+  monitoredUserEmail: string,
+  internalDomains: string[]
 ): MappedInteraction {
   const attendeeEmails = event.attendees.map((a) =>
     a.emailAddress.address.toLowerCase()
   );
   const organizerEmail = event.organizer.emailAddress.address.toLowerCase();
+  const allParticipants = [organizerEmail, ...attendeeEmails];
 
-  // TODO: Determine if meeting is internal or external based on email domains
-  const direction: MappedInteraction["direction"] = "outbound"; // TODO: compute properly
+  const isOrganizer = organizerEmail === monitoredUserEmail.toLowerCase();
+  const direction = detectDirection(isOrganizer, allParticipants, internalDomains);
 
   return {
     sourceId: event.id,
@@ -111,12 +111,66 @@ export function mapCalendarEvent(
     occurredAt: event.start.dateTime,
     subject: event.subject,
     bodyText: event.bodyPreview || null,
-    participantEmails: [organizerEmail, ...attendeeEmails],
+    participantEmails: allParticipants,
     rawMetadata: {
       endTime: event.end.dateTime,
       location: event.location?.displayName,
       isOnlineMeeting: event.isOnlineMeeting,
       isCancelled: event.isCancelled,
+      attendeeResponses: event.attendees.map((a) => ({
+        email: a.emailAddress.address,
+        response: a.status.response,
+      })),
     },
   };
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Detect email/meeting direction based on participants and internal domains.
+ * - All participants from internal domains → "internal"
+ * - From monitored user with external recipients → "outbound"
+ * - Otherwise → "inbound"
+ */
+export function detectDirection(
+  isFromMonitoredUser: boolean,
+  allParticipantEmails: string[],
+  internalDomains: string[]
+): MappedInteraction["direction"] {
+  const domainSet = new Set(internalDomains.map((d) => d.toLowerCase()));
+
+  const allInternal = allParticipantEmails.every((email) => {
+    const domain = email.toLowerCase().split("@")[1];
+    return domain && domainSet.has(domain);
+  });
+
+  if (allInternal) return "internal";
+  if (isFromMonitoredUser) return "outbound";
+  return "inbound";
+}
+
+/**
+ * Strip HTML tags from email body if content type is HTML.
+ * Returns plain text or null.
+ */
+export function stripHtml(
+  content: string | null | undefined,
+  contentType: string | null | undefined
+): string | null {
+  if (!content) return null;
+  if (contentType?.toLowerCase() !== "html") return content;
+
+  // Basic HTML stripping — removes tags and decodes common entities
+  return content
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/\s+/g, " ")
+    .trim();
 }
