@@ -1,5 +1,9 @@
 import { FastifyInstance } from "fastify";
+import { eq, sql } from "drizzle-orm";
+import { db } from "../db/index.js";
+import { signals } from "../db/schema.js";
 import { logger } from "../lib/logger.js";
+import { syncEmailQueue } from "../lib/queue.js";
 
 export async function webhookRoutes(app: FastifyInstance) {
   // Microsoft Graph subscription validation + notifications
@@ -12,7 +16,7 @@ export async function webhookRoutes(app: FastifyInstance) {
       return reply.type("text/plain").send(query.validationToken);
     }
 
-    // Notification payload
+    // Notification payload — queue immediate mail sync for affected users
     const body = request.body as any;
     if (body?.value) {
       for (const notification of body.value) {
@@ -20,7 +24,16 @@ export async function webhookRoutes(app: FastifyInstance) {
           { resource: notification.resource, changeType: notification.changeType },
           "Graph webhook notification"
         );
-        // TODO: Queue event processing via BullMQ
+
+        // Extract user ID from resource path (e.g., "users/{id}/messages/{id}")
+        const userMatch = (notification.resource as string)?.match(/users\/([^/]+)/);
+        if (userMatch) {
+          await syncEmailQueue.add("graph-webhook-sync", {
+            tenantId: notification.tenantId ?? "unknown",
+            userId: userMatch[1],
+            trigger: "webhook",
+          });
+        }
       }
     }
 
@@ -40,7 +53,20 @@ export async function webhookRoutes(app: FastifyInstance) {
                 { messageId: status.id, status: status.status },
                 "WhatsApp delivery status"
               );
-              // TODO: Update signal delivery status
+
+              // Update signal delivery status based on WhatsApp callback
+              const waMessageId = status.id as string;
+              const waStatus = status.status as string;
+
+              if (waStatus === "delivered") {
+                await db.execute(
+                  sql`UPDATE signals SET delivered_at = now() WHERE context_snapshot->>'waMessageId' = ${waMessageId}`
+                );
+              } else if (waStatus === "read") {
+                await db.execute(
+                  sql`UPDATE signals SET opened_at = now() WHERE context_snapshot->>'waMessageId' = ${waMessageId}`
+                );
+              }
             }
           }
         }

@@ -1,24 +1,16 @@
-import { config } from "@/config";
+import { createHmac } from "node:crypto";
+import { logger } from "../../lib/logger.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface WhatsAppConfig {
   phoneNumberId: string;
-  apiKey: string;
-  businessAccountId: string;
-}
-
-export interface WhatsAppMessage {
-  to: string;
-  templateName?: string;
-  templateParams?: Record<string, string>;
-  text?: string;
-  /** Optional header image URL */
-  headerImageUrl?: string;
+  accessToken: string;
+  appSecret?: string;
 }
 
 export interface WhatsAppSendResult {
-  messageId: string;
+  messageId: string | null;
   status: "sent" | "failed";
   error?: string;
 }
@@ -26,24 +18,53 @@ export interface WhatsAppSendResult {
 // ─── Sender ──────────────────────────────────────────────────────────────────
 
 /**
- * Send a WhatsApp message using the Cloud API.
- * Supports both template messages and free-form text.
+ * Send a WhatsApp text message via the Cloud API.
  */
 export async function sendMessage(
-  message: WhatsAppMessage,
+  to: string,
+  text: string,
   waConfig: WhatsAppConfig
 ): Promise<WhatsAppSendResult> {
-  // TODO: POST to https://graph.facebook.com/v18.0/{phoneNumberId}/messages
-  // Headers: Authorization: Bearer {apiKey}
-  // Body varies by template vs text message
-  // Handle rate limiting and retries
+  const log = logger.child({ to });
 
-  throw new Error("Not implemented");
+  try {
+    const response = await fetch(
+      `https://graph.facebook.com/v19.0/${waConfig.phoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${waConfig.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          to,
+          type: "text",
+          text: { body: text },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      log.error({ status: response.status, errorBody }, "WhatsApp send failed");
+      return { messageId: null, status: "failed", error: errorBody };
+    }
+
+    const result = (await response.json()) as { messages?: Array<{ id: string }> };
+    const messageId = result.messages?.[0]?.id ?? null;
+
+    log.info({ messageId }, "WhatsApp message sent");
+    return { messageId, status: "sent" };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    log.error({ error: msg }, "WhatsApp send error");
+    return { messageId: null, status: "failed", error: msg };
+  }
 }
 
 /**
  * Send a signal notification via WhatsApp.
- * Formats the signal content into a WhatsApp-friendly template.
  */
 export async function sendSignalNotification(
   phone: string,
@@ -51,16 +72,7 @@ export async function sendSignalNotification(
   body: string,
   waConfig: WhatsAppConfig
 ): Promise<WhatsAppSendResult> {
-  // TODO: Format signal into WhatsApp template
-  // Use the "signal_notification" template with title and body params
-  return sendMessage(
-    {
-      to: phone,
-      templateName: "signal_notification",
-      templateParams: { title, body },
-    },
-    waConfig
-  );
+  return sendMessage(phone, body, waConfig);
 }
 
 /**
@@ -71,6 +83,6 @@ export function verifyWebhookSignature(
   signature: string,
   appSecret: string
 ): boolean {
-  // TODO: HMAC-SHA256 verification
-  throw new Error("Not implemented");
+  const expected = createHmac("sha256", appSecret).update(payload).digest("hex");
+  return `sha256=${expected}` === signature;
 }

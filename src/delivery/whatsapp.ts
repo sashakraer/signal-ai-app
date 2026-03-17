@@ -1,4 +1,4 @@
-import { sendSignalNotification, type WhatsAppConfig, type WhatsAppSendResult } from "@/adapters/whatsapp/sender";
+import { sendSignalNotification, type WhatsAppConfig } from "../adapters/whatsapp/sender.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
